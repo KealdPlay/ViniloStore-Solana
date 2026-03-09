@@ -1,217 +1,323 @@
 use anchor_lang::prelude::*;
-// ID del Solana Program, este espacio se llena automaticamente al haver el "build"
+
+// El Program ID se genera automáticamente al hacer "Build" en Solana Playground.
 declare_id!("");
 
-#[program] // Macro que convierte codigo de Rust a Solana. Apartir de aqui empieza tu codigo!
-pub mod biblioteca {
-    use super::*; // Importa todas los structs y enums definidos fuera del modulo
+// =============================================================================
+//  VINILO STORE - Smart Contract en Solana
+// =============================================================================
+// Programa que permite a un propietario gestionar su tienda de discos de vinilo
+// directamente en la blockchain de Solana.
+//
+// ARQUITECTURA:
+//   Una sola cuenta PDA por propietario (semillas: ["tienda", propietario]).
+//   Esa cuenta almacena un Vec<Vinilo> con todos los discos del catálogo.
+//   Cada vinilo tiene: artista, álbum, género, precio, stock y estado.
+//
+// INSTRUCCIONES (CRUD):
+//   inaugurar_tienda  -> CREATE  - Abre la tienda y reserva espacio en la blockchain
+//   agregar_vinilo    -> CREATE  - Añade un disco al catálogo
+//   ver_catalogo      -> READ    - Imprime el catálogo completo en el log de la transacción
+//   actualizar_vinilo -> UPDATE  - Modifica precio, stock y/o estado de un disco
+//   retirar_vinilo    -> DELETE  - Elimina un disco del catálogo por nombre de álbum
+//
+// SEGURIDAD:
+//   has_one = propietario garantiza que solo el dueño original puede
+//   modificar su tienda. Anchor valida esto en cada instrucción de escritura.
+// =============================================================================
 
-    //////////////////////////// Instruccion: Crear Biblioteca /////////////////////////////////////
-    /*
-    Permite la creacion de una PDA (Program Derived Adress), un tipo especial de cuenta en solana que permite prescindir 
-    del uso de llaves privadas para la firma de transacciones. 
+#[program]
+pub mod vinilo_store {
+    use super::*;
 
-    Esta cuenta contendra el objeto (struct) de tipo Biblioteca donde podremos almacenar los Libros. 
-    La creacion de la PDA depende de 3 cosas:
-        * Wallet address 
-        * Program ID 
-        * string representativo, regularmente relacionado con el nombre del proyecto
-    
-    La explicacion de esto continua en el struct NuevaBiblioteca
+    // =========================================================================
+    // CREATE - Inaugurar la Tienda
+    // =========================================================================
+    // Inicializa la cuenta PDA del propietario. Solo se puede llamar una vez
+    // por wallet. Si se llama de nuevo, Anchor arrojará un error porque la
+    // cuenta ya existe (init no permite reinicialización).
+    //
+    // Parámetros:
+    //   nombre_tienda -> Nombre de tu tienda
+    // =========================================================================
+    pub fn inaugurar_tienda(ctx: Context<InaugurarTienda>, nombre_tienda: String) -> Result<()> {
+        let tienda = &mut ctx.accounts.tienda;
 
-    Parametros de entrada:
-        * nombre -> nombre de la biblioteca -> tipo string
-     */
-    pub fn crear_biblioteca(context: Context<NuevaBiblioteca>, nombre: String) -> Result<()> {
-        // "Context" siempre suele ir como primer parametro, ya que permite acceder al objeto o cuenta con el que queremos interactuar
-        // Dentro del context va al tipo de objeto o cuenta con el que deseamos interactuar. 
-        let owner_id = context.accounts.owner.key(); // Accedemos al wallet address del caller 
-        msg!("Owner id: {}", owner_id); // Print de verificacion
+        tienda.propietario = ctx.accounts.propietario.key();
+        tienda.nombre = nombre_tienda.clone();
+        tienda.catalogo = Vec::new(); // Catálogo vacío al inaugurar
 
-        let libros: Vec<Libro> = Vec::new(); // Crea un vector vacio 
-
-        // Creamos un Struct de tipo biblioteca y lo guardamos directamente 
-        context.accounts.biblioteca.set_inner(Biblioteca { 
-            owner: owner_id,
-            nombre,
-            libros,
-        });
-        Ok(()) // Representa una transaccion exitosa 
+        msg!(
+            "Tienda '{}' inaugurada con éxito en la blockchain!",
+            nombre_tienda
+        );
+        Ok(())
     }
 
-    //////////////////////////// Instruccion: Agregar Libro /////////////////////////////////////
-    /*
-    Agrega un libro al vector de libros ontenido en el struct Biblioteca. 
-    En este caso el contexto empleado es el struct NuevoLibro. Mientras que NuevaBiblioteca permite crear 
-    Instancias de una Biblioteca. NuevoLibro permite crear y modificar los valores relacionados a cualquier
-    struct de tipo Libro.
+    // =========================================================================
+    // CREATE (Add) - Agregar un Vinilo al catálogo
+    // =========================================================================
+    // Añade un nuevo disco al Vec<Vinilo> de la tienda.
+    // Falla si el catálogo ya tiene 20 vinilos (límite definido por InitSpace).
+    // Falla si ya existe un disco con el mismo álbum + artista.
+    //
+    // Parámetros:
+    //   artista -> Nombre del artista o banda    (ej. "Pink Floyd")
+    //   album   -> Título del álbum              (ej. "The Dark Side of the Moon")
+    //   genero  -> Género musical                (ej. "Rock Progresivo")
+    //   precio  -> Precio en centavos MXN (u64)  (ej. 85000 = $850.00 MXN)
+    //   stock   -> Unidades disponibles (u8)      (ej. 3)
+    // =========================================================================
+    pub fn agregar_vinilo(
+        ctx: Context<GestionarTienda>,
+        artista: String,
+        album: String,
+        genero: String,
+        precio: u64,
+        stock: u8,
+    ) -> Result<()> {
+        let tienda = &mut ctx.accounts.tienda;
 
-    Parametros de entrada:
-        * nombre -> nombre del libro -> string
-        * paginas -> numero de paginas del libro -> u16
-     */ 
-    pub fn agregar_libro(context: Context<NuevoLibro>, nombre: String, paginas: u16) -> Result<()> {
-        require!( // Medida de seguridad para identificar que SOLO el owner de la biblioteca sea el que hace cambios en ella
-            context.accounts.biblioteca.owner == context.accounts.owner.key(), // Condicion, true -> continua, false -> error
-            Errores::NoEresElOwner // Codigo de error, ver enum Errores
-        ); 
+        // Validar que no se exceda el límite del Vec
+        require!(tienda.catalogo.len() < 20, Errores::CatalogoLleno);
 
-        let libro = Libro { // Creacion de un struct tipo Libro
-            nombre,
-            paginas,
-            disponible: true,
+        // Evitar duplicados: mismo artista + mismo álbum
+        let ya_existe = tienda
+            .catalogo
+            .iter()
+            .any(|v| v.artista == artista && v.album == album);
+        require!(!ya_existe, Errores::ViniloYaExiste);
+
+        let nuevo_vinilo = Vinilo {
+            artista: artista.clone(),
+            album: album.clone(),
+            genero,
+            precio,
+            stock,
+            estado: String::from("Disponible"), // Estado inicial por defecto
         };
 
-        context.accounts.biblioteca.libros.push(libro); // Agrega el Libro al vector de libros de Biblioteca
+        tienda.catalogo.push(nuevo_vinilo);
 
-        Ok(()) // Transaccion exitosa
+        msg!(
+            " Vinilo agregado: '{}' de {} | Precio: ${}.{:02} MXN | Stock: {}",
+            album,
+            artista,
+            precio / 100,
+            precio % 100,
+            stock
+        );
+        Ok(())
     }
 
-    //////////////////////////// Instruccion: Eliminar Libro /////////////////////////////////////
-    /*
-    Elimina un libro apartir de su nombre. Error si libro no existe, Error si vector vacio. 
+    // =========================================================================
+    // READ - Ver el catálogo completo
+    // =========================================================================
+    // Imprime en el log de la transacción todos los discos del catálogo,
+    // incluyendo artista, álbum, género, precio, stock y estado.
+    //
+    // Nota técnica: en Solana el estado de una cuenta también puede leerse
+    // off-chain con program.account.tienda.fetch(pda) sin costo de transacción.
+    // Esta instrucción existe para completar el CRUD on-chain y permite
+    // verificar el catálogo directamente desde el explorador de Solana.
+    //
+    // Parámetros: ninguno.
+    // =========================================================================
+    pub fn ver_catalogo(ctx: Context<GestionarTienda>) -> Result<()> {
+        let tienda = &ctx.accounts.tienda;
 
-    Parametros de entrada:
-        * nombre -> Nombre del libro -> string
-     */
-    pub fn eliminar_libro(context: Context<NuevoLibro>, nombre: String) -> Result<()> {
-        require!( // Medida de seguridad
-            context.accounts.biblioteca.owner == context.accounts.owner.key(),
-            Errores::NoEresElOwner
+        msg!(
+            "Catalogo de '{}' | Total: {} vinilo(s)",
+            tienda.nombre,
+            tienda.catalogo.len()
         );
 
-        let libros = &mut context.accounts.biblioteca.libros; // Referencia mutable al vector de libros
-
-        for i in 0..libros.len() { // Se itera mediante el indice todo el contenido del vector en busca del libro a eliminar
-            if libros[i].nombre == nombre { // Si lo encuentra prodece a borrarlo mediante el metodo remove
-                libros.remove(i);
-                msg!("Libro {} eliminado!", nombre); // Mensaje de borrado exitoso
-                return Ok(()); // Transaccion exitosa
-            }
-        }
-        Err(Errores::LibroNoExiste.into()) // Transaccion fallida, nunca encontro el libro
-    }
-
-    //////////////////////////// Instruccion: Ver Libros /////////////////////////////////////
-    /*
-    Muestra en el log de la transaccion el contenido completo del vector de libros de la Biblioteca
-
-    Parametros de entrada:
-        Ninguno
-     */
-    pub fn ver_libros(context: Context<NuevoLibro>) -> Result<()> {
-        require!( // Medida de seguridad 
-            context.accounts.biblioteca.owner == context.accounts.owner.key(),
-            Errores::NoEresElOwner
-        );
-
-        // :#? requiere que NuevoLibro tenga atributo Debug. Permite la visualizacion completa del vector en el log
-        msg!("La lista de libros actualmente es: {:#?}", context.accounts.biblioteca.libros); // Print en log
-        Ok(()) // Transaccion exitosa 
-    }
-
-    
-    //////////////////////////// Instruccion: Alternar Estado /////////////////////////////////////
-    /* 
-    Cambia el estado de disponible de false a true o de true a false.
-
-    Parametros de entrada:
-        * nombre -> Nombre del libro -> string
-     */
-    pub fn alternar_estado(context: Context<NuevoLibro>, nombre: String) -> Result<()> {
-        require!( // Medida de seguridad
-            context.accounts.biblioteca.owner == context.accounts.owner.key(),
-            Errores::NoEresElOwner
-        );
-
-        let libros = &mut context.accounts.biblioteca.libros; // Referencia mutable al vector de libros
-        for i in 0..libros.len() { // Se itera mediante el indice el vector de libros
-            let estado = libros[i].disponible;  // Se almacena el estado del vector actual
-
-            if libros[i].nombre == nombre { // Si ecuentra el nombre del libro procede a cambiar el valor del estado 
-                let nuevo_estado = !estado;
-                libros[i].disponible = nuevo_estado;
-                msg!("El libro: {} ahora tiene un valor de disponibilidad: {}", nombre, nuevo_estado); // log print de la nueva disponibilidad
-                return Ok(()); // Transaccion exitosa
-            }
+        if tienda.catalogo.is_empty() {
+            msg!("   (El catálogo está vacío)");
+            return Ok(());
         }
 
-        Err(Errores::LibroNoExiste.into()) // Transaccion fallida, libro no existe
+        for (i, v) in tienda.catalogo.iter().enumerate() {
+            msg!(
+                "   [{}] '{}' - {} | Género: {} | ${}.{:02} MXN | Stock: {} | {}",
+                i + 1,
+                v.album,
+                v.artista,
+                v.genero,
+                v.precio / 100,
+                v.precio % 100,
+                v.stock,
+                v.estado,
+            );
+        }
+
+        Ok(())
     }
 
+    // =========================================================================
+    // UPDATE - Actualizar datos de un Vinilo
+    // =========================================================================
+    // Busca un disco por nombre de álbum y actualiza su precio, stock y estado.
+    // Solo el propietario puede llamar esta instrucción (validado por has_one).
+    //
+    // Parámetros:
+    //   album        -> Álbum a buscar (clave de búsqueda en el catálogo)
+    //   nuevo_precio -> Nuevo precio en centavos MXN
+    //   nuevo_stock  -> Nueva cantidad de unidades disponibles
+    //   nuevo_estado -> "Disponible", "Agotado" o "Reservado"
+    // =========================================================================
+    pub fn actualizar_vinilo(
+        ctx: Context<GestionarTienda>,
+        album: String,
+        nuevo_precio: u64,
+        nuevo_stock: u8,
+        nuevo_estado: String,
+    ) -> Result<()> {
+        // Validar que el estado sea uno de los tres valores permitidos
+        require!(
+            nuevo_estado == "Disponible"
+                || nuevo_estado == "Agotado"
+                || nuevo_estado == "Reservado",
+            Errores::EstadoInvalido
+        );
+
+        let catalogo = &mut ctx.accounts.tienda.catalogo;
+
+        // Buscar el índice del vinilo por nombre de álbum
+        if let Some(pos) = catalogo.iter().position(|v| v.album == album) {
+            catalogo[pos].precio = nuevo_precio;
+            catalogo[pos].stock = nuevo_stock;
+            catalogo[pos].estado = nuevo_estado.clone();
+
+            msg!(
+                "  '{}' actualizado -> Precio: ${}.{:02} | Stock: {} | Estado: {}",
+                album,
+                nuevo_precio / 100,
+                nuevo_precio % 100,
+                nuevo_stock,
+                nuevo_estado
+            );
+            return Ok(());
+        }
+
+        Err(Errores::ViniloNoEncontrado.into())
+    }
+
+    // =========================================================================
+    // DELETE - Retirar un Vinilo del catálogo
+    // =========================================================================
+    // Busca un disco por nombre de álbum y lo elimina del Vec.
+    // Nota: esto NO libera la cuenta de la blockchain (el espacio sigue reservado).
+    // El tamaño de la cuenta fue fijado en la inauguración con InitSpace.
+    //
+    // Parámetros:
+    //   album -> Título del álbum a eliminar
+    // =========================================================================
+    pub fn retirar_vinilo(ctx: Context<GestionarTienda>, album: String) -> Result<()> {
+        let catalogo = &mut ctx.accounts.tienda.catalogo;
+
+        if let Some(pos) = catalogo.iter().position(|v| v.album == album) {
+            catalogo.remove(pos);
+            msg!("Retirado: Vinilo '{}' retirado del catálogo.", album);
+            return Ok(());
+        }
+
+        Err(Errores::ViniloNoEncontrado.into())
+    }
 }
 
-/*
-Codigos de error
-Todos los codigos se almacenan en un enum con la siguiente estructura:
-#[msg("MENSAJE DE ERROR")] (dentro de las comillas)
-NombreDelError, (En camel case)
-*/
-#[error_code]
-pub enum Errores {
-    #[msg("Error, no eres el propietario de la biblioteca que deseas modificar")]
-    NoEresElOwner,
-    #[msg("Error, el libro con el que deseas interactuar no existe")]
-    LibroNoExiste,
-}
+// =============================================================================
+// ESTRUCTURAS DE DATOS
+// =============================================================================
 
-#[account] // Especifica que el strcut es una cuenta que se almacenara en la blockchain
-#[derive(InitSpace)] // Genera la constante INIT_SPACE y determina el espacio de almacenamiento necesario 
-pub struct Biblioteca { // Define la Biblioteca
-    owner: Pubkey, // Pubkey es un formato de llave publica de 32 bytes 
-
-    #[max_len(60)] // Cantidad maxima de caracteres del string: nombre
-    nombre: String,
-
-    #[max_len(10)] // Tamaño maximo del vector libros 
-    libros: Vec<Libro>,
-}
-
-/*
-Struct interno o secundario (No es una cuenta). Se define por derive y cuenta con los siguientes atributos:
-    * AnchorSerialize -> Permite guardar el struct en la cuenta 
-    * AnchorDeserialize -> Permite leer su contenido desde la cuenta 
-    * Clone -> Para copiar su contenido o valores 
-    * InitSpace -> Calcula el tamaño necesario para ser almacenado en la blockchain
-    * PartialEq -> Para usar sus valores y compararlos con "=="
-    * Debug -> Para mostrarlo en log con ":?" o ":#?"
-*/
+/// Struct secundario (no es una cuenta). Representa un disco individual.
+/// Se serializa/deserializa dentro del Vec<Vinilo> de la cuenta Tienda.
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, InitSpace, PartialEq, Debug)]
-pub struct Libro {
+pub struct Vinilo {
     #[max_len(60)]
-    nombre: String,
-
-    // Los siguientes datos no rquieren de max_len porque ya estan definidos (numero de 16 bits y false o true)
-    paginas: u16, 
-
-    disponible: bool,
+    pub artista: String, // Nombre del artista o banda
+    #[max_len(80)]
+    pub album: String, // Título del álbum (también sirve como clave de búsqueda)
+    #[max_len(40)]
+    pub genero: String, // Género musical
+    pub precio: u64, // Precio en centavos MXN (ej. 85000 = $850.00)
+    pub stock: u8,   // Unidades disponibles
+    #[max_len(20)]
+    pub estado: String, // "Disponible" | "Agotado" | "Reservado"
 }
 
+/// Cuenta principal de la tienda. Una PDA por propietario.
+/// Contiene el catálogo completo como Vec<Vinilo> (máximo 20 discos).
+#[account]
+#[derive(InitSpace)]
+pub struct Tienda {
+    pub propietario: Pubkey, // 32 bytes - Wallet del dueño de la tienda
+    #[max_len(50)]
+    pub nombre: String, // Nombre de la tienda
+    #[max_len(20)] // Límite de 20 vinilos por tienda
+    pub catalogo: Vec<Vinilo>,
+}
 
-// Creacion de los contextos para las instrucciones (funciones)
-#[derive(Accounts)] // Especifica que este struct describe las cuentas que se requieren para determinada instruccion
-pub struct NuevaBiblioteca<'info> { // contexto de la instruccion
-    #[account(mut)] 
-    pub owner: Signer<'info>, // Se define que el owner como el que pagara la transaccion, por eso es mut, para que cambie el balance de la cuenta
+// =============================================================================
+// CONTEXTOS DE INSTRUCCIÓN (Validación de cuentas)
+// =============================================================================
+
+/// Contexto para inaugurar la tienda (CREATE).
+/// `init` garantiza que la cuenta se crea una sola vez.
+/// La PDA se deriva de la semilla "tienda" + la clave pública del propietario,
+/// lo que hace que cada wallet tenga exactamente una tienda única.
+#[derive(Accounts)]
+pub struct InaugurarTienda<'info> {
+    #[account(mut)]
+    pub propietario: Signer<'info>,
 
     #[account(
-        init, // Inidica que al llamar la instruccuion se creara una cuenta
-        // puede ser remplazado por "init_if_needed" para que solo se cree una vez por caller
-        payer = owner, // Se especifica que quien paga el llamado a la instruccion, en este caso llama la instruccion 
-        space = Biblioteca::INIT_SPACE + 8, // Se calcula el espacio requerido para almacenar el Solana Program On-Chain
-        seeds = [b"biblioteca", owner.key().as_ref()], // Se especifica que la cuenta es una PDA que depende de un string y el id del owner
-        bump // Metodo para determinar el el id de la biblioteca en base a lo anterior 
+        init,
+        payer = propietario,
+        space = 8 + Tienda::INIT_SPACE,          // 8 bytes de discriminador + tamaño calculado
+        seeds = [b"tienda", propietario.key().as_ref()],
+        bump
     )]
-    pub biblioteca: Account<'info, Biblioteca>, // Se especifica que la cuenta creada (PDA) almacenara la biblioteca 
+    pub tienda: Account<'info, Tienda>,
 
-    pub system_program: Program<'info, System>, // Programa necesario para crear la cuenta 
+    pub system_program: Program<'info, System>,
 }
 
-// Contexto para la creacion y modificacion de libros 
-#[derive(Accounts)] // Especifica que este struct se requiere para todas las instrucciones relacionadas con la creacion o modificacion de Libro
-pub struct NuevoLibro<'info> {
-    pub owner: Signer<'info>, // El owner de la cuenta es quien paga la transaccion
+/// Contexto compartido para READ, UPDATE y DELETE.
+/// Para READ no se necesita `mut` en la cuenta, pero reutilice este contexto
+/// por simplicidad - Anchor solo escribirá si la instrucción lo hace explícitamente.
+/// `has_one = propietario` valida que quien firma sea el mismo dueño registrado
+/// en la cuenta, impidiendo que wallets ajenos accedan a la tienda.
+#[derive(Accounts)]
+pub struct GestionarTienda<'info> {
+    pub propietario: Signer<'info>,
 
-    #[account(mut)] 
-    pub biblioteca: Account<'info, Biblioteca>, // Se marca biblioteca como mutable porque se modificara tanto el vector como los libros que contiene
+    #[account(
+        mut,
+        has_one = propietario @ Errores::NoEresElPropietario,
+        seeds = [b"tienda", propietario.key().as_ref()],
+        bump
+    )]
+    pub tienda: Account<'info, Tienda>,
+}
+
+// =============================================================================
+// CÓDIGOS DE ERROR
+// =============================================================================
+#[error_code]
+pub enum Errores {
+    #[msg("No tienes permisos: no eres el propietario de esta tienda.")]
+    NoEresElPropietario,
+
+    #[msg("El catálogo ya tiene 20 vinilos. Retira uno antes de agregar otro.")]
+    CatalogoLleno,
+
+    #[msg("Ese álbum no está en el catálogo.")]
+    ViniloNoEncontrado,
+
+    #[msg("Ese vinilo ya existe en el catálogo (mismo artista y álbum).")]
+    ViniloYaExiste,
+
+    #[msg("Estado inválido. Usa únicamente: 'Disponible', 'Agotado' o 'Reservado'.")]
+    EstadoInvalido,
 }
